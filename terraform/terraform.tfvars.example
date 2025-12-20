@@ -1,0 +1,2 @@
+# Copia este archivo a terraform.tfvars y pon tus valores reales
+admin_password = "CAMBIAME_POR_UNA_PASSWORD_SEGURA"

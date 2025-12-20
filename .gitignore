@@ -1,0 +1,11 @@
+# .gitignore
+.DS_Store
+**/.idea/
+**/.vscode/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars          <-- CRÍTICO: Esto ignora tu archivo de secretos real
+!terraform.tfvars.example  <-- EXCEPCIÓN: Esto permite subir el ejemplo
