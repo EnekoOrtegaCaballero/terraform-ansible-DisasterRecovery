@@ -1,0 +1,43 @@
+<%@ Page Language="C#" %>
+<%@ Import Namespace="System.Data.SqlClient" %>
+<%@ Import Namespace="System.Web.Configuration" %>
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="utf-8">
+    <title>Laboratorio de Resiliencia</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f4f9; text-align: center; padding-top: 50px; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 600px; margin: 0 auto; }
+        h1 { color: #333; }
+        .status { font-weight: bold; font-size: 1.2em; padding: 10px; border-radius: 4px; display: inline-block; margin-top: 10px; }
+        .success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Estado del Sistema de Resiliencia</h1>
+        <hr/>
+        <%
+            string connString = WebConfigurationManager.ConnectionStrings["MyDbConn"].ConnectionString;
+            try {
+                using (SqlConnection conn = new SqlConnection(connString)) {
+                    conn.Open();
+                    SqlCommand cmd = new SqlCommand("SELECT @@VERSION", conn);
+                    string version = (string)cmd.ExecuteScalar();
+                    
+                    Response.Write("<div class='status success'>✅ CONEXIÓN ESTABLECIDA</div>");
+                    Response.Write("<p>Conectado al servidor: <b>" + conn.DataSource + "</b></p>");
+                    Response.Write("<p><small>Motor SQL: " + version.Substring(0, 25) + "...</small></p>");
+                }
+            } catch (Exception ex) {
+                Response.Write("<div class='status error'>❌ FALLO DE CONEXIÓN</div>");
+                Response.Write("<p>No se pudo conectar a la Base de Datos.</p>");
+                Response.Write("<p style='text-align:left; font-family:monospace; font-size:0.9em;'>Detalle: " + ex.Message + "</p>");
+            }
+        %>
+        <p><i>Este laboratorio demuestra la recuperación automática de desastres.</i></p>
+    </div>
+</body>
+</html>

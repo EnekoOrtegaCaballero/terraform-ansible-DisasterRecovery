@@ -9,3 +9,24 @@
 *.tfstate.backup
 *.tfvars
 !terraform.tfvars.example
+
+#Ansible
+ansible/inventory.ini
+ansible/group_vars/windows.yml
+
+# ... (Mantén lo que ya tenías) ...
+
+# --- ARTEFACTOS Y TEMPORALES ---
+# La carpeta de simulación de paquetes (ZIPs)
+artifacts/
+
+# Logs de ejecución del orquestador
+scripts/deployment_log_*.txt
+
+# --- ANSIBLE (Archivos generados por Terraform) ---
+ansible/inventory.ini
+ansible/group_vars/windows.yml
+
+# --- TERRAFORM ---
+# Bloqueo de proveedores (Opcional: En equipos se suele subir, en labs personales se puede ignorar)
+terraform/.terraform.lock.hcl

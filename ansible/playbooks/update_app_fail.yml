@@ -1,0 +1,55 @@
+---
+- name: Despliegue de Actualización v2.0 (Simulación de Fallo)
+  hosts: windows
+  gather_facts: no
+
+  vars:
+    # Ruta relativa desde ansible/playbooks/ hacia la raíz
+    local_package: "../../artifacts/update_pkg.zip"
+    remote_temp: "C:\\Temp\\Deploy"
+
+  tasks:
+    - name: 1. Crear directorio temporal en servidor
+      ansible.windows.win_file:
+        path: "{{ remote_temp }}"
+        state: directory
+
+    - name: 2. Subir el paquete de actualización (.zip)
+      ansible.windows.win_copy:
+        src: "{{ local_package }}"
+        dest: "{{ remote_temp }}\\update_pkg.zip"
+
+    - name: 3. Extraer el paquete
+      ansible.windows.win_shell: |
+        $zipPath = "{{ remote_temp }}\\update_pkg.zip"
+        $destPath = "{{ remote_temp }}\\v2.0"
+        
+        # Limpiamos destino si existe y descomprimimos
+        if (Test-Path $destPath) { Remove-Item $destPath -Recurse -Force }
+        Expand-Archive -Path $zipPath -DestinationPath $destPath -Force
+        
+        Write-Host "Paquete extraído en $destPath"
+
+    - name: 4. EJECUTAR EL SCRIPT DE ACTUALIZACIÓN (CON LOGGING SEGURO)
+      ansible.windows.win_shell: |
+        $scriptPath = "{{ remote_temp }}\\v2.0\\install.ps1"
+        $logPath = "{{ remote_temp }}\\installation_log.txt"
+        
+        Write-Host "Iniciando ejecución..."
+        
+        # 1. Ejecutamos y capturamos TODO (*>&1) en una variable.
+        #    IMPORTANTE: No usamos tuberías (|) aquí para no perder el ExitCode.
+        $Output = & $scriptPath -actualiza "true" *>&1
+        
+        # 2. Guardamos el código de salida INMEDIATAMENTE
+        $SavedExitCode = $LASTEXITCODE
+        
+        # 3. Ahora que tenemos el código a salvo, guardamos el log en disco y pantalla
+        $Output | Out-File $logPath -Encoding UTF8
+        Write-Output $Output
+        
+        # 4. Verificamos el código que guardamos antes
+        if ($SavedExitCode -ne 0) {
+            Write-Error "El script falló (Exit Code: $SavedExitCode). Revisar logs en $logPath"
+            exit $SavedExitCode
+        }

@@ -1,0 +1,68 @@
+========================================================================
+GUÍA DE OPERACIONES: LABORATORIO DISASTER RECOVERY & AUTOMATION
+========================================================================
+
+--- FASE 0: PRERREQUISITOS ---
+1. Tener credenciales de AWS configuradas (~/.aws/credentials).
+2. Tener instalado: Terraform, Ansible, PowerShell (pwsh) y Zip.
+
+--- FASE 1: DESPLIEGUE DE INFRAESTRUCTURA (Terraform) ---
+Objetivo: Levantar Red, Servidor EC2 (Windows) y Base de Datos (RDS SQL Server).
+
+3. Entrar en la carpeta de Terraform:
+   cd terraform
+
+4. Inicializar plugins (solo la primera vez):
+   terraform init
+
+5. Aplicar el plan de infraestructura:
+   terraform apply -auto-approve
+
+   > NOTA: Este paso tarda aprox. 15 minutos (creación de RDS).
+   > Terraform generará automáticamente:
+   >  - ../ansible/inventory.ini (IPs)
+   >  - ../ansible/group_vars/windows.yml (Credenciales)
+
+6. Volver a la raíz del proyecto:
+   cd ..
+
+--- FASE 2: CONFIGURACIÓN INICIAL (Ansible) ---
+Objetivo: Instalar IIS, ASP.NET y desplegar la App v1.0 funcional.
+
+7. Verificar conectividad con Windows (WinRM):
+   ansible -i ansible/inventory.ini windows -m win_ping
+
+8. Desplegar la Aplicación Base (v1.0):
+   ansible-playbook -i ansible/inventory.ini ansible/playbooks/deploy_app.yml
+
+   > VALIDACIÓN: Entrar a http://<IP_PUBLICA_EC2>/
+   > Debe mostrar: "Estado del Sistema: CONEXIÓN ESTABLECIDA" (Verde).
+
+--- FASE 3: SIMULACIÓN DE DESASTRE (Orquestación) ---
+Objetivo: Simular un despliegue fallido de la v2.0 y capturar el error.
+
+9. Generar/Actualizar el Artefacto Malicioso (.zip):
+   (Si has modificado install.ps1, debes regenerar el zip)
+   cd artifacts/v2.0
+   rm ../update_pkg.zip 2> /dev/null
+   zip -r ../update_pkg.zip .
+   cd ../..
+
+10. Ejecutar el Orquestador Maestro:
+    pwsh scripts/orchestrator.ps1
+
+    > RESULTADO ESPERADO:
+    > - El script sube el ZIP y ejecuta la actualización.
+    > - Ansible falla (capturando el exit code 1 del script remoto).
+    > - El Orquestador muestra: "❌ FALLO CRÍTICO EN LA ACTUALIZACIÓN".
+    > - El Orquestador detecta: "⚠️ DETECTADO: Fallo en migración de Base de Datos".
+
+--- UTILIDADES ---
+- Ver logs locales de despliegue:
+  cat scripts/deployment_log_YYYYMMDD-HHMM.txt
+
+- Ver logs en el servidor remoto (vía RDP o Ansible):
+  C:\Temp\Deploy\installation_log.txt
+
+- Destruir el laboratorio (Ahorro de costes):
+  cd terraform && terraform destroy -auto-approve

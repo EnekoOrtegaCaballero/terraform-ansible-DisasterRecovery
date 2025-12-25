@@ -68,7 +68,7 @@ resource "aws_security_group" "web_sg" {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = ["${chomp(data.http.my_public_ip.response_body)}/32"]
   }
 
   # Entrada: RDP (Opcional para debug) - Solo desde TU IP actual
@@ -137,4 +137,60 @@ resource "aws_db_instance" "sql_db" {
   tags = {
     Name = "ProductionDB"
   }
+}
+
+
+# --- 5. AUTOMATIZACIÓN DE ANSIBLE (GENERACIÓN DE ARCHIVOS) ---
+
+# A) Generar el INVENTARIO automáticamente (inventory.ini)
+resource "local_file" "ansible_inventory" {
+  content = <<EOT
+[windows]
+${aws_instance.app_server.public_ip}
+
+[windows:vars]
+ansible_connection=winrm
+ansible_winrm_server_cert_validation=ignore
+ansible_port=5986
+ansible_winrm_transport=basic
+EOT
+  filename = "../ansible/inventory.ini" 
+}
+
+# B) Generar las VARIABLES automáticamente (group_vars/windows.yml)
+resource "local_file" "ansible_vars" {
+  content = <<EOT
+# ARCHIVO GENERADO AUTOMÁTICAMENTE POR TERRAFORM
+# Credenciales de Windows
+ansible_user: "ansible_admin"
+ansible_password: "${var.admin_password}"
+
+# Datos de la Base de Datos
+db_host: "${aws_db_instance.sql_db.address}"
+db_user: "adminSql"
+db_password: "${var.db_password}"
+EOT
+  filename = "../ansible/group_vars/windows.yml"
+}
+
+
+# --- 6. ALMACENAMIENTO EXTRA (Disco de Datos) ---
+
+# A) Crear el disco duro (EBS Volume)
+resource "aws_ebs_volume" "data_disk" {
+  # IMPORTANTE: Debe estar en la misma zona que la máquina
+  availability_zone = aws_instance.app_server.availability_zone
+  size              = 10  # Tamaño en GB
+  type              = "gp3"
+
+  tags = {
+    Name = "Lab-Data-Disk"
+  }
+}
+
+# B) Conectar el disco a la máquina
+resource "aws_volume_attachment" "ebs_att" {
+  device_name = "/dev/xvdb" # En Windows esto suele mapearse como disco D: o E:
+  volume_id   = aws_ebs_volume.data_disk.id
+  instance_id = aws_instance.app_server.id
 }

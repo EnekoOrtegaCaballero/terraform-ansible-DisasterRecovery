@@ -48,3 +48,11 @@ Set-Item WSMan:\localhost\Service\Auth\Basic -Value $true # Aún requerimos Basi
 Write-Host "Configuración WinRM HTTPS completada."
 Stop-Transcript
 </powershell>
+
+# 8. Inicializar y Formatear Discos Extra (Para que aparezca la unidad D:)
+Write-Host "Inicializando discos de datos..."
+# Busca discos que estén en estado RAW (sin partición) y los inicializa
+Get-Disk | Where-Object PartitionStyle -eq 'Raw' | Initialize-Disk -PartitionStyle MBR -PassThru | New-Partition -AssignDriveLetter -UseMaximumSize | Format-Volume -FileSystem NTFS -NewFileSystemLabel "DataDisk" -Confirm:$false
+
+Write-Host "Configuración completada."
+Stop-Transcript

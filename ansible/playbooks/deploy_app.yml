@@ -1,0 +1,110 @@
+---
+- name: Instalación de IIS y Despliegue de App ASP.NET (En Disco D:)
+  hosts: windows
+  gather_facts: yes
+
+  vars:
+    web_root: "D:\\app"
+    app_pool_name: "ResiliencyPool"
+
+  tasks:
+    # 1. Instalar Features
+    - name: Instalar IIS y ASP.NET 4.5
+      ansible.windows.win_feature:
+        name:
+          - Web-Server
+          - Web-Asp-Net45
+          - Web-ISAPI-Ext
+          - Web-ISAPI-Filter
+          - Web-Mgmt-Console
+          - Web-Scripting-Tools # Importante para gestionar IIS por PowerShell
+        state: present
+
+    # 2. PREPARAR EL DISCO D
+    - name: Detectar y Formatear Disco de Datos como D
+      ansible.windows.win_shell: |
+        if (-not (Test-Path "D:")) {
+            Write-Host "Configurando disco nuevo..."
+            $disk = Get-Disk | Where-Object PartitionStyle -eq 'Raw'
+            if ($disk) {
+                $disk | Initialize-Disk -PartitionStyle GPT -PassThru | New-Partition -DriveLetter "D" -UseMaximumSize | Format-Volume -FileSystem NTFS -NewFileSystemLabel "DataDisk" -Confirm:$false
+                Write-Host "Disco D: configurado correctamente."
+            } else {
+                # Si no hay disco RAW, asumimos que ya está todo bien o no hay disco
+                Write-Warning "No se encontró disco RAW. Verificando si D existe."
+            }
+        }
+
+    # 3. CREAR APP POOL (MOVIMOS ESTO ARRIBA)
+    # Lo creamos antes de asignar permisos para que el usuario "IIS AppPool\Nombre" exista
+    - name: Crear Application Pool dedicado
+      community.windows.win_iis_webapppool:
+        name: "{{ app_pool_name }}"
+        state: started
+        managed_runtime_version: v4.0
+        managed_pipeline_mode: Integrated
+
+    # 4. CREAR CARPETA Y PERMISOS
+    - name: Crear directorio de la aplicación en D
+      ansible.windows.win_file:
+        path: "{{ web_root }}"
+        state: directory
+
+    - name: Asignar permisos a IIS_IUSRS en D:\\app
+      ansible.windows.win_acl:
+        path: "{{ web_root }}"
+        user: IIS_IUSRS
+        rights: ReadAndExecute
+        type: allow
+        state: present
+
+    # Ahora esto NO fallará porque el AppPool ya existe (Paso 3)
+    - name: Asignar permisos al AppPool en D:\\app
+      ansible.windows.win_acl:
+        path: "{{ web_root }}"
+        user: "IIS AppPool\\{{ app_pool_name }}"
+        rights: ReadAndExecute
+        type: allow
+        state: present
+
+    # 5. CONFIGURAR EL SITIO WEB (USANDO POWERSHELL NATIVO)
+    # El módulo de Ansible fallaba con Hashtables, PowerShell es infalible aquí.
+    - name: Cambiar ruta de Default Web Site a D:\\app y asignar AppPool
+      ansible.windows.win_shell: |
+        Import-Module WebAdministration
+        $site = 'IIS:\Sites\Default Web Site'
+        
+        # Cambiar la ruta física
+        Set-ItemProperty $site -Name physicalPath -Value "{{ web_root }}"
+        
+        # Asignar el App Pool
+        Set-ItemProperty $site -Name applicationPool -Value "{{ app_pool_name }}"
+        
+        # Reiniciar el sitio para aplicar cambios
+        Restart-WebItem $site
+
+    # 6. COPIAR ARCHIVOS
+    - name: Copiar aplicación ASPX
+      ansible.windows.win_template:
+        src: ../templates/dbtest.aspx.j2
+        dest: "{{ web_root }}\\default.aspx"
+
+    # FIX DE CODIFICACIÓN (UTF-8 BOM)
+    - name: Convertir default.aspx a UTF-8 con BOM
+      ansible.windows.win_shell: |
+        $path = "{{ web_root }}\\default.aspx"
+        if (Test-Path $path) {
+            $content = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+            $utf8WithBom = New-Object System.Text.UTF8Encoding $True
+            [System.IO.File]::WriteAllText($path, $content, $utf8WithBom)
+        }
+
+    - name: Configurar conexión a BBDD (web.config)
+      ansible.windows.win_template:
+        src: ../templates/web.config.j2
+        dest: "{{ web_root }}\\web.config"
+
+    - name: Reiniciar IIS
+      ansible.windows.win_service:
+        name: W3SVC
+        state: restarted
