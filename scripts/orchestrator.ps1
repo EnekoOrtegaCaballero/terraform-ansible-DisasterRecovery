@@ -1,18 +1,17 @@
 # scripts/orchestrator.ps1
 
 # ==============================================================================
-#  ORQUESTADOR DE RESILIENCIA Y RECUPERACIÓN (Versión Final v3.0)
+#  ORQUESTADOR DE RESILIENCIA Y RECUPERACIÓN (Versión Final v3.1)
 # ==============================================================================
 
 # --- 0. CALCULAR RUTAS ABSOLUTAS ---
 $ProjectRoot     = Split-Path -Parent $PSScriptRoot
-$TerraformDir    = Join-Path $ProjectRoot "terraform"  # <--- FALTABA ESTA VARIABLE
+$TerraformDir    = Join-Path $ProjectRoot "terraform"
 $AnsiblePlaybook = Join-Path $ProjectRoot "ansible/playbooks/update_app_fail.yml"
 $Inventory       = Join-Path $ProjectRoot "ansible/inventory.ini"
 $AnsibleVars     = Join-Path $ProjectRoot "ansible/group_vars/windows.yml"
 $ArtifactZip     = Join-Path $ProjectRoot "artifacts/update_pkg.zip"
 $LogFile         = "deployment_log_$(Get-Date -Format 'yyyyMMdd-HHmm').txt"
-
 
 Write-Host "🚀 INICIANDO PIPELINE DE DESPLIEGUE v2.0" -ForegroundColor Cyan
 Write-Host "📂 Directorio del Proyecto: $ProjectRoot" -ForegroundColor DarkGray
@@ -21,26 +20,18 @@ Write-Host "📂 Directorio del Proyecto: $ProjectRoot" -ForegroundColor DarkGra
 #  FASE DE VALIDACIÓN (SAFETY CHECKS)
 # ==============================================================================
 
-# CHECK 1: ¿Existe el inventario?
 if (-not (Test-Path $Inventory)) {
     Write-Host "❌ ERROR CRÍTICO: No se encuentra el inventario ($Inventory)." -ForegroundColor Red
-    Write-Host "   Causa probable: La infraestructura (Terraform) está apagada." -ForegroundColor Gray
     exit 1
 }
-
-# CHECK 2: ¿Existen las variables?
 if (-not (Test-Path $AnsibleVars)) {
     Write-Host "❌ ERROR CRÍTICO: No se encuentran las variables ($AnsibleVars)." -ForegroundColor Red
     exit 1
 }
-
-# CHECK 3: ¿Existe el paquete ZIP?
 if (-not (Test-Path $ArtifactZip)) {
     Write-Host "❌ ERROR CRÍTICO: No se encuentra el paquete ($ArtifactZip)." -ForegroundColor Red
     exit 1
 }
-
-# CHECK 4: ¿Está Ansible instalado?
 if (-not (Get-Command "ansible-playbook" -ErrorAction SilentlyContinue)) {
     Write-Host "❌ ERROR CRÍTICO: 'ansible-playbook' no está instalado." -ForegroundColor Red
     exit 1
@@ -56,8 +47,139 @@ try {
     Import-Module AWS.Tools.RDS -ErrorAction Stop
 } catch {
     Write-Host "❌ ERROR CRÍTICO: Fallo al cargar módulos AWS Tools." -ForegroundColor Red
-    Write-Host "   Ejecuta: Install-Module -Name AWS.Tools.Common, AWS.Tools.EC2, AWS.Tools.RDS -Scope CurrentUser -Force" -ForegroundColor Gray
     exit 1
+}
+
+# ==============================================================================
+#  FUNCIÓN: RESTORE-INFRASTRUCTURE (Versión v3.3 - Blindada)
+# ==============================================================================
+function Restore-Infrastructure {
+    param (
+        [string]$SnapshotTag,
+        [string]$OriginalDbId,
+        [string]$OriginalVolId,
+        [string]$Ec2Id
+    )
+
+    Write-Host "`n🚑 [RECOVERY] Iniciando protocolo de Recuperación de Desastres..." -ForegroundColor Magenta
+
+    # --- PASO 1: RECUPERACIÓN DE BASE DE DATOS (RDS) ---
+    $NewDbId = "lab-db-recovered"
+    Write-Host "   1. Restaurando Base de Datos desde Snapshot ($SnapshotTag)..." -ForegroundColor Yellow
+
+    try {
+        # FIX: Evitar duplicados si Get-RDSDBInstance devuelve arrays
+        $OriginalDb = Get-RDSDBInstance -DBInstanceIdentifier $OriginalDbId | Select-Object -First 1
+        $VpcSgIds = @($OriginalDb.VpcSecurityGroups.VpcSecurityGroupId | Select-Object -Unique)
+
+	# CHECK ROBUSTO: ¿Existe ya la instancia?
+        $InstanceExists = $false
+        try {
+            # Intentamos obtenerla. Si no existe, AWS lanza error y saltamos al catch.
+            $null = Get-RDSDBInstance -DBInstanceIdentifier $NewDbId -ErrorAction Stop
+            $InstanceExists = $true
+        } catch {
+            # Si falla, asumimos que es porque no existe (lo cual es bueno)
+            Write-Host "      (La instancia '$NewDbId' está limpia/no existe, procedemos a crearla)" -ForegroundColor DarkGray
+        }
+
+        if ($InstanceExists) {
+             Write-Host "      ⚠️ La instancia '$NewDbId' ya existe (residuo anterior)." -ForegroundColor DarkGray
+             Write-Host "      Intentando borrado de emergencia..." -ForegroundColor Yellow
+             
+             try {
+                Remove-RDSDBInstance -DBInstanceIdentifier $NewDbId -SkipFinalSnapshot $true -Force -ErrorAction Stop
+                
+                Write-Host "      Esperando eliminación..." -NoNewline
+                while (Get-RDSDBInstance -DBInstanceIdentifier $NewDbId -ErrorAction SilentlyContinue) { 
+                    Write-Host -NoNewline "."
+                    Start-Sleep -Seconds 10 
+                }
+                Write-Host " ¡Eliminada!"
+             } catch {
+                Write-Host "`n      ❌ NO SE PUEDE LIMPIAR: La instancia está bloqueada." -ForegroundColor Red
+                throw "Intervención manual requerida: Borra '$NewDbId' en AWS Console."
+             }
+        }
+        # LANZAR RESTAURACIÓN
+        Restore-RDSDBInstanceFromDBSnapshot `
+            -DBSnapshotIdentifier $SnapshotTag `
+            -DBInstanceIdentifier $NewDbId `
+            -VpcSecurityGroupId $VpcSgIds `
+            -DBSubnetGroupName $OriginalDb.DBSubnetGroup.DBSubnetGroupName `
+            -PubliclyAccessible $false `
+            -ErrorAction Stop | Out-Null
+            
+        Write-Host "      Solicitud de restauración RDS enviada. ID: $NewDbId" -ForegroundColor Gray
+
+    } catch {
+        Write-Host "      ❌ Error solicitando restauración RDS: $_" -ForegroundColor Red
+        throw $_
+    }
+
+    # --- PASO 2: RECUPERACIÓN DE DISCO (EBS SWAP) ---
+    Write-Host "   2. Intercambiando Disco de Datos (EBS Swap)..." -ForegroundColor Yellow
+    
+    try {
+        # A) Buscar Snapshot de Disco
+        $EbsSnap = Get-EC2Snapshot -Filter @{Name="description";Values="*$SnapshotTag*"} | Select-Object -First 1
+        if (-not $EbsSnap) { throw "No se encontró Snapshot de disco con tag $SnapshotTag" }
+
+        # B) Obtener Zona de Disponibilidad
+        $Instance = Get-EC2Instance -InstanceId $Ec2Id
+        $AZ = $Instance.Instances[0].Placement.AvailabilityZone
+
+        # C) Crear Volumen
+        Write-Host "      Creando nuevo volumen desde $($EbsSnap.SnapshotId) en $AZ..." -ForegroundColor Gray
+        $NewVol = New-EC2Volume -SnapshotId $EbsSnap.SnapshotId -AvailabilityZone $AZ -VolumeType gp3 -ErrorAction Stop
+        
+        while ((Get-EC2Volume -VolumeId $NewVol.VolumeId).State -ne "available") { Start-Sleep -Seconds 2 }
+
+        # D) DETENER INSTANCIA
+        Write-Host "      Deteniendo instancia $Ec2Id para intercambio de hardware..." -ForegroundColor Yellow
+        Stop-EC2Instance -InstanceId $Ec2Id -Force -ErrorAction Stop | Out-Null
+        while ((Get-EC2Instance -InstanceId $Ec2Id).Instances[0].State.Name -ne "stopped") { Write-Host -NoNewline "."; Start-Sleep -Seconds 5 }
+        Write-Host ""
+
+        # E) DESCONECTAR DISCO VIEJO
+        Write-Host "      Desconectando disco corrupto ($OriginalVolId)..." -ForegroundColor Gray
+        Dismount-EC2Volume -VolumeId $OriginalVolId -InstanceId $Ec2Id -Force -ErrorAction Stop | Out-Null
+        while ((Get-EC2Volume -VolumeId $OriginalVolId).State -ne "available") { Start-Sleep -Seconds 2 }
+
+        # F) CONECTAR DISCO NUEVO
+        Write-Host "      Conectando disco recuperado ($($NewVol.VolumeId))..." -ForegroundColor Gray
+        Add-EC2Volume -VolumeId $NewVol.VolumeId -InstanceId $Ec2Id -Device "/dev/xvdb" -ErrorAction Stop | Out-Null
+        while ((Get-EC2Volume -VolumeId $NewVol.VolumeId).Attachments[0].State -ne "attached") { Start-Sleep -Seconds 2 }
+
+        # G) ARRANCAR INSTANCIA
+        Write-Host "      Arrancando instancia..." -ForegroundColor Green
+        Start-EC2Instance -InstanceId $Ec2Id -ErrorAction Stop | Out-Null
+        while ((Get-EC2Instance -InstanceId $Ec2Id).Instances[0].State.Name -ne "running") { Write-Host -NoNewline "."; Start-Sleep -Seconds 5 }
+        Write-Host ""
+        
+        Write-Host "      Esperando inicio de Windows (30s)..." -ForegroundColor Gray
+        Start-Sleep -Seconds 30
+
+    } catch {
+        Write-Host "      ❌ Error en EBS Swap: $_" -ForegroundColor Red
+        throw $_
+    }
+
+    # --- PASO 3: ESPERAR A LA BASE DE DATOS ---
+    Write-Host "   3. Finalizando restauración de Base de Datos..." -ForegroundColor Yellow
+    $DbStatus = "creating"
+    while ($DbStatus -ne "available") {
+        Start-Sleep -Seconds 15
+        $DbStatus = (Get-RDSDBInstance -DBInstanceIdentifier $NewDbId).DBInstanceStatus
+        Write-Host -NoNewline "."
+    }
+    Write-Host ""
+    
+    # Obtener el nuevo Endpoint
+    $NewEndpoint = (Get-RDSDBInstance -DBInstanceIdentifier $NewDbId).Endpoint.Address
+    Write-Host "   ✅ BBDD Recuperada. Nuevo Endpoint: $NewEndpoint" -ForegroundColor Green
+
+    return $NewEndpoint
 }
 # ==============================================================================
 #  FASE 1: PREPARACIÓN Y BACKUP (PARALELO)
@@ -66,7 +188,6 @@ Write-Host "📸 FASE 1: Iniciando Protocolo de Seguridad..." -ForegroundColor C
 
 # 1. Obtener Datos desde Terraform
 Write-Host "   Consultando Terraform state..." -ForegroundColor Gray
-# [BLOQUE DE RUTAS Y DATOS - IGUAL QUE ANTES]
 if (-not (Test-Path $TerraformDir)) { Write-Host "❌ ERROR: Carpeta Terraform no encontrada."; exit 1 }
 Push-Location -Path $TerraformDir
 try { $JsonOutput = terraform output -json } finally { Pop-Location }
@@ -91,7 +212,6 @@ try {
 $BackupTag = "snap-pre-update-$(Get-Date -Format 'yyyyMMdd-HHmm')"
 Write-Host "   🚀 Lanzando solicitudes de backup en paralelo ($BackupTag)..." -ForegroundColor Yellow
 
-# A) Lanzar RDS
 try {
     $RdsSnap = New-RDSDBSnapshot -DBSnapshotIdentifier $BackupTag -DBInstanceIdentifier $RDS_ID -ErrorAction Stop
     Write-Host "      + RDS: Solicitud enviada." -ForegroundColor Green
@@ -100,13 +220,11 @@ try {
     exit 1
 }
 
-# B) Lanzar Disco
 try {
     $EbsSnap = New-EC2Snapshot -VolumeId $DATA_DISK_ID -Description "Backup App Data $BackupTag" -ErrorAction Stop
     Write-Host "      + Disco D: Solicitud enviada." -ForegroundColor Green
 } catch {
     Write-Host "      ❌ Fallo al solicitar Disco: $_" -ForegroundColor Red
-    # Seguimos, la DB es prioritaria
 }
 
 # 4. ESPERAR A AMBOS (WAIT)
@@ -115,31 +233,24 @@ Write-Host "   ⏳ Esperando finalización de tareas en segundo plano..." -Foreg
 $RdsStatus = "creating"
 $EbsStatus = "pending"
 $Timeout = 0
-$MaxWaitSeconds = 900 # 15 minutos
+$MaxWaitSeconds = 900 
 
-# El bucle sigue mientras ALGUNO de los dos no haya terminado
 while (($RdsStatus -ne "available" -or $EbsStatus -ne "completed") -and $Timeout -lt $MaxWaitSeconds) {
     Start-Sleep -Seconds 15
     $Timeout += 15
     
-    # Actualizar estado RDS (si no ha acabado ya)
     if ($RdsStatus -ne "available") {
         $CurrentRds = Get-RDSDBSnapshot -DBSnapshotIdentifier $BackupTag
         $RdsStatus = $CurrentRds.Status
     }
-
-    # Actualizar estado Disco (si no ha acabado ya)
     if ($EbsStatus -ne "completed") {
         $CurrentEbs = Get-EC2Snapshot -SnapshotId $EbsSnap.SnapshotId
         $EbsStatus = $CurrentEbs.State
     }
-
-    # Barra de estado dinámica
     Write-Host -NoNewline "`r      [Tiempo: ${Timeout}s] Estado RDS: $RdsStatus | Estado Disco: $EbsStatus      "
 }
-Write-Host "" # Salto de línea final
+Write-Host ""
 
-# 5. VERIFICACIÓN FINAL
 if ($RdsStatus -eq "available") {
     Write-Host "   ✅ Backups completados correctamente." -ForegroundColor Green
 } else {
@@ -152,7 +263,6 @@ if ($RdsStatus -eq "available") {
 # ==============================================================================
 Write-Host "📦 Subiendo y Ejecutando actualización..." -ForegroundColor Yellow
 
-# Configuración del proceso .NET para captura robusta de errores
 $ProcessInfo = New-Object System.Diagnostics.ProcessStartInfo
 $ProcessInfo.FileName = "ansible-playbook"
 $ProcessInfo.Arguments = "-i $Inventory $AnsiblePlaybook"
@@ -169,7 +279,6 @@ $Process.WaitForExit()
 $AnsibleExitCode = $Process.ExitCode
 $Output = $StdOut + "`n" + $StdErr
 
-# CHECK EXTRA: Detección de Falsos Positivos
 if ($AnsibleExitCode -eq 0 -and $Output -match "skipping: no hosts matched") {
     $AnsibleExitCode = 99
     $Output += "`n[ORQUESTADOR]: ALERTA - Inventario vacío o grupo incorrecto."
@@ -180,7 +289,6 @@ if ($AnsibleExitCode -eq 0 -and $Output -match "skipping: no hosts matched") {
 # ==============================================================================
 
 if ($AnsibleExitCode -ne 0) {
-    # --- CASO DE FALLO ---
     Write-Host "❌ FALLO CRÍTICO EN LA ACTUALIZACIÓN (Código: $AnsibleExitCode)" -ForegroundColor Red -BackgroundColor Black
     
     Write-Host "Analizando la salida del script remoto..." -ForegroundColor Yellow
@@ -188,28 +296,60 @@ if ($AnsibleExitCode -ne 0) {
     if ($Output -match "CRITICAL EXCEPTION") {
         Write-Host "⚠️ DETECTADO: Fallo en migración de Base de Datos (ver detalle en el log)" -ForegroundColor Red
     } 
-    elseif ($Output -match "Unreachable" -or $Output -match "Failed to connect") {
-        Write-Host "⚠️ DETECTADO: Error de Conectividad (Host caído o WinRM fallando)" -ForegroundColor DarkRed
-    }
-    elseif ($AnsibleExitCode -eq 99) {
-         Write-Host "⚠️ DETECTADO: Ansible no encontró anfitriones (Target vacío)" -ForegroundColor Magenta
+    elseif ($Output -match "Unreachable") {
+        Write-Host "⚠️ DETECTADO: Error de Conectividad" -ForegroundColor DarkRed
     }
     else {
         Write-Host "⚠️ DETECTADO: Error genérico de Ansible" -ForegroundColor Magenta
-        Write-Host "Últimas líneas del log:" -ForegroundColor Gray
-        $Output.Split("`n") | Select-Object -Last 10
     }
     
-    # --- GUARDADO DE LOGS ---
     $LogPath = Join-Path $PSScriptRoot $LogFile
     $Output | Out-File $LogPath
     Write-Host "📄 Log guardado en: $LogPath"
     
     # --- DISPARO DE ROLLBACK ---
     Write-Host "🚑 INICIANDO RESTAURACIÓN AUTOMÁTICA..." -ForegroundColor Magenta
-    # Restore-Infrastructure (Pendiente Fase 4)
+    
+    try {
+        # 1. Ejecutar la función de Recuperación (PowerShell AWS)
+        $NewDbEndpoint = Restore-Infrastructure `
+            -SnapshotTag $BackupTag `
+            -OriginalDbId $RDS_ID `
+            -OriginalVolId $DATA_DISK_ID `
+            -Ec2Id $EC2_ID
+
+        # 2. Ejecutar la Reparación de la App (Ansible)
+        Write-Host "🛠️ Ejecutando Playbook de Reparación (Ansible)..." -ForegroundColor Cyan
+        
+        $RepairPlaybook = Join-Path $ProjectRoot "ansible/playbooks/repair_app.yml"
+        # OJO: Comillas escapadas para PowerShell
+        $AnsibleArgs = "-i $Inventory $RepairPlaybook --extra-vars `"new_db_host=$NewDbEndpoint`""
+        
+        $RepairInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $RepairInfo.FileName = "ansible-playbook"
+        $RepairInfo.Arguments = $AnsibleArgs
+        $RepairInfo.RedirectStandardOutput = $true
+        $RepairInfo.UseShellExecute = $false
+        
+        $RepairProcess = [System.Diagnostics.Process]::Start($RepairInfo)
+        
+        while (-not $RepairProcess.HasExited) {
+            $line = $RepairProcess.StandardOutput.ReadLine()
+            if ($line) { Write-Host $line -ForegroundColor Gray }
+        }
+        $RepairProcess.WaitForExit()
+
+        if ($RepairProcess.ExitCode -eq 0) {
+            Write-Host "`n✅✅ RECUPERACIÓN COMPLETADA CON ÉXITO ✅✅" -ForegroundColor Green -BackgroundColor Black
+            Write-Host "El sistema ha sobrevivido. La web apunta a la nueva BBDD y el disco D: ha sido restaurado."
+        } else {
+            Write-Host "❌ Ansible falló al reparar la aplicación." -ForegroundColor Red
+        }
+
+    } catch {
+        Write-Host "❌ FALLÓ LA RECUPERACIÓN AUTOMÁTICA: $_" -ForegroundColor Red
+    }
 }
 else {
-    # --- CASO DE ÉXITO ---
     Write-Host "✅ Actualización completada con éxito." -ForegroundColor Green
 }

@@ -1,0 +1,68 @@
+---
+- name: Protocolo de Recuperación Montado de Disco y Reconfiguración
+  hosts: windows
+  gather_facts: no
+
+  vars:
+    web_root: "D:\\app"
+    web_config_path: "D:\\app\\web.config"
+    app_pool_name: "ResiliencyPool"
+    # 'new_db_host' debe venir inyectada desde el Orquestador
+
+  tasks:
+    - name: 1. Detener IIS (Parada de seguridad)
+      ansible.windows.win_service:
+        name: W3SVC
+        state: stopped
+
+    # CRÍTICO: Cuando conectas un volumen nuevo en AWS a Windows, 
+    # a menudo aparece como "Offline" o "Read-Only" por seguridad.
+    # Esta tarea fuerza a Windows a ponerlo Online y asignarle la letra D.
+    - name: 2. Asegurar que el disco recuperado está Online y es D
+      ansible.windows.win_shell: |
+        # Buscar discos que estén Offline y ponerlos Online
+        $disks = Get-Disk | Where-Object IsOffline -eq $true
+        foreach ($d in $disks) {
+            Set-Disk -InputObject $d -IsOffline $false -IsReadOnly $false
+        }
+        
+        # Asegurar que la partición tiene la letra D
+        # (El snapshot recuerda la partición, pero a veces pierde la letra al cambiar de máquina/volumen)
+        $vol = Get-Partition | Where-Object { $_.DriveLetter -eq $null -and $_.Type -eq "Basic" } | Select-Object -First 1
+        if ($vol) {
+            Set-Partition -InputObject $vol -NewDriveLetter "D"
+        }
+        Write-Host "Discos verificados."
+
+    # QUIRÚRGICO: Ya no usamos templates. Editamos el fichero existente
+    # preservando el resto de configuraciones que hubiera en el snapshot.
+    - name: 3. Parchear Web.Config con nueva BBDD (Regex Replace)
+      ansible.windows.win_shell: |
+        $configPath = "{{ web_config_path }}"
+        $newHost = "{{ new_db_host }}"
+        
+        if (-not (Test-Path $configPath)) {
+            Write-Error "CRÍTICO: No se encuentra el web.config en el disco restaurado."
+            exit 1
+        }
+
+        # Leemos el contenido original (que viene del backup)
+        $content = [System.IO.File]::ReadAllText($configPath)
+        
+        # Usamos Regex para buscar "Server=LO_QUE_SEA;" y cambiarlo por "Server=NUEVA_IP;"
+        # El patrón busca: Server= (cualquier cosa que no sea punto y coma) ;
+        $newContent = $content -replace "Server=[^;]+;", "Server=$newHost;"
+        
+        # Guardamos el cambio
+        [System.IO.File]::WriteAllText($configPath, $newContent)
+        
+        Write-Host "Web.Config actualizado apuntando a: $newHost"
+
+    - name: 4. Arrancar IIS
+      ansible.windows.win_service:
+        name: W3SVC
+        state: started
+
+    - name: 5. Reciclar AppPool (Purgar conexiones viejas)
+      ansible.windows.win_shell: |
+        Restart-WebAppPool -Name "{{ app_pool_name }}"
