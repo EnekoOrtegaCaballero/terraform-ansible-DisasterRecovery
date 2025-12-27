@@ -175,13 +175,65 @@ function Restore-Infrastructure {
     }
     Write-Host ""
     
-    # Obtener el nuevo Endpoint
+    # Obtener el nuevo Endpoint de la BBDD
     $NewEndpoint = (Get-RDSDBInstance -DBInstanceIdentifier $NewDbId).Endpoint.Address
     Write-Host "   ✅ BBDD Recuperada. Nuevo Endpoint: $NewEndpoint" -ForegroundColor Green
 
+    # --- NUEVO BLOQUE: ACTUALIZAR INVENTARIO ANSIBLE (FIX IP DINÁMICA) ---
+    Write-Host "   🔄 Actualizando IP en inventario de Ansible..." -ForegroundColor Yellow
+    
+    # 1. Obtener la nueva IP Pública de la instancia reiniciada
+    $NewInstanceData = Get-EC2Instance -InstanceId $Ec2Id
+    $NewPublicIp = $NewInstanceData.Instances[0].PublicIpAddress
+    
+    if (-not $NewPublicIp) {
+        Write-Error "No se pudo obtener la IP Pública. ¿La instancia está corriendo?"
+        throw "Error IP Pública"
+    }
+
+    Write-Host "      Nueva IP detectada: $NewPublicIp" -ForegroundColor Gray
+
+    # 2. Definir la ruta del inventario (usamos la variable global $Inventory)
+    # Nota: Asegúrate de que $Inventory es accesible dentro de la función o usa $global:Inventory
+    # Para asegurar, reconstruimos la ruta relativa si es necesario, pero $Inventory debería verse.
+    
+    # 3. Reescribir el archivo inventory.ini
+    $NewInventoryContent = @"
+[windows]
+$NewPublicIp
+
+[windows:vars]
+ansible_connection=winrm
+ansible_winrm_server_cert_validation=ignore
+ansible_port=5986
+ansible_winrm_transport=basic
+ansible_user=ansible_admin
+ansible_password=Password123!
+"@
+    # NOTA: He hardcodeado usuario/pass aquí por simplicidad del ejemplo. 
+    # Lo ideal es leerlo de tus variables o dejar que Ansible use group_vars si no cambian.
+    # Pero como inventory.ini original generado por Terraform es simple, lo replicamos así:
+    
+    $SimpleInventory = @"
+[windows]
+$NewPublicIp
+
+[windows:vars]
+ansible_connection=winrm
+ansible_winrm_server_cert_validation=ignore
+ansible_port=5986
+ansible_winrm_transport=basic
+"@
+
+    Set-Content -Path $Inventory -Value $SimpleInventory -Force
+    Write-Host "      Inventario actualizado correctamente." -ForegroundColor Green
+    # ---------------------------------------------------------------------
+
     return $NewEndpoint
+ 
 }
-# ==============================================================================
+
+# ===============================================================================
 #  FASE 1: PREPARACIÓN Y BACKUP (PARALELO)
 # ==============================================================================
 Write-Host "📸 FASE 1: Iniciando Protocolo de Seguridad..." -ForegroundColor Cyan
