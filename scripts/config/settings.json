@@ -1,0 +1,27 @@
+{
+  "project": {
+    "name": "DisasterRecoveryLab",
+    "logPrefix": "deployment_log_"
+  },
+  "aws": {
+    "profile": "default",
+    "region_fallback": "us-east-1",
+    "backup_tag_prefix": "snap-pre-update-"
+  },
+  "timeouts": {
+    "backup_wait_seconds": 900,
+    "restore_wait_seconds": 1800,
+    "polling_interval": 15
+  },
+  "paths": {
+    "terraform": "terraform",
+    "ansible_inventory": "ansible/inventory.ini",
+    "ansible_vars": "ansible/group_vars/windows.yml",
+    "ansible_playbooks": "ansible/playbooks",
+    "artifact_zip": "artifacts/update_pkg.zip"
+  },
+  "playbooks": {
+    "deploy_fail": "update_app_fail.yml",
+    "repair": "repair_app.yml"
+  }
+}
